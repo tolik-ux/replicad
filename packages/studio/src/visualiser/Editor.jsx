@@ -13,6 +13,7 @@ import Download from "../icons/Download.jsx";
 import Configure from "../icons/Configure.jsx";
 import Reload from "../icons/Reload.jsx";
 import Clipping from "../icons/Clipping.jsx";
+import Plus from "../icons/Plus.jsx";
 
 import EditorViewer from "../viewers/EditorViewer.jsx";
 
@@ -21,6 +22,7 @@ import Toolbar from "../components/Toolbar.jsx";
 import ParamsEditor from "./editor/ParamsEditor.jsx";
 import ClippingParams from "./editor/ClippingParams.jsx";
 import DownloadDialog from "./editor/DownloadDialog.jsx";
+import ModelSelector from "../components/ModelSelector.jsx";
 import useEditorStore, { EditorContextProvider } from "./editor/useEditorStore";
 
 import {
@@ -134,12 +136,110 @@ const WelcomeScreen = observer(() => {
 
 const EditorView = observer(function Editor() {
   const store = useEditorStore();
+  const [showModelSelector, setShowModelSelector] = useState(false);
+  const [addedModels, setAddedModels] = useState([]);
 
   const shape = store.ui.shapeSelected;
 
-  if (!store.code.listeningFileOnDisk && !store.currentMesh?.length) {
-    return <WelcomeScreen />;
+  // Функция для генерации кода сборки из списка моделей
+  const generateAssemblyCode = (models) => {
+    if (models.length === 0) return '';
+    
+    // Если только одна модель, возвращаем её код напрямую
+    if (models.length === 1) {
+      return models[0].code;
+    }
+
+    // Извлекаем импорты из всех моделей и объединяем их
+    const allImports = new Set();
+    const modelCodes = [];
+
+    models.forEach((model, index) => {
+      // Извлекаем импорты
+      const importMatch = model.code.match(/^const\s+\{[^}]+\}\s*=\s*replicad;?\s*$/m);
+      if (importMatch) {
+        const importLine = importMatch[0].trim();
+        // Извлекаем имена импортируемых переменных
+        const varMatch = importLine.match(/\{([^}]+)\}/);
+        if (varMatch) {
+          const vars = varMatch[1].split(',').map(v => v.trim());
+          vars.forEach(v => allImports.add(v));
+        }
+      }
+
+      // Убираем импорты, export default и переименовываем main
+      let modelCode = model.code
+        .replace(/^const\s+\{[^}]+\}\s*=\s*replicad;?\s*$/m, '')
+        .replace(/export default main;?/g, '')
+        .replace(/const main = /g, `const model${index}Main = `)
+        .trim();
+      
+      // Переименовываем defaultParams в каждой модели
+      modelCode = modelCode.replace(/const defaultParams = /g, `const defaultParams${index} = `);
+      
+      // Оборачиваем код модели в IIFE для создания отдельной области видимости
+      modelCodes.push(`
+// Модель ${index + 1}: ${model.name}
+(() => {
+${modelCode}
+  window.model${index}Main = model${index}Main;
+})();
+`);
+    });
+
+    // Создаем объединенный импорт
+    const combinedImport = `const { ${Array.from(allImports).join(', ')} } = replicad;`;
+
+    const assemblyCode = `
+// Автоматически сгенерированная сборка из ${models.length} моделей
+${combinedImport}
+
+${modelCodes.join('\n\n')}
+
+const main = () => {
+  const assembly = [];
+  ${models.map((model, index) => {
+    const offset = models.slice(0, index).reduce((sum, m) => sum + (m.width || 1000) + 100, 0);
+    // Определяем параметры для вызова функции
+    const paramsStr = model.defaultParams ? JSON.stringify(model.defaultParams) : '{}';
+    return `
+  // Модель ${index + 1}: ${model.name}
+  let model${index}Result;
+  try {
+    // Пытаемся вызвать с параметрами по умолчанию
+    model${index}Result = window.model${index}Main(${paramsStr});
+  } catch (e) {
+    // Если не работает, пробуем вызвать с пустым объектом
+    try {
+      model${index}Result = window.model${index}Main({});
+    } catch (e2) {
+      // Если и это не работает, пробуем вызвать без параметров
+      model${index}Result = window.model${index}Main();
+    }
   }
+  if (Array.isArray(model${index}Result)) {
+    model${index}Result.forEach(shape => {
+      assembly.push(shape.translate([${offset}, 0, 0]));
+    });
+  } else {
+    assembly.push(model${index}Result.translate([${offset}, 0, 0]));
+  }
+`;
+  }).join('\n')}
+
+  return assembly;
+};
+
+export default main;
+`;
+
+    return assemblyCode;
+  };
+
+  // Удаляем WelcomeScreen, чтобы сразу открывался визуализатор
+  // if (!store.code.listeningFileOnDisk && !store.currentMesh?.length) {
+  //   return <WelcomeScreen />;
+  // }
 
   return (
     <>
@@ -207,6 +307,9 @@ const EditorView = observer(function Editor() {
               <Configure />
             </Button>
           )}
+          <Button small onClick={() => setShowModelSelector(true)}>
+            <Plus />
+          </Button>
         </ButtonBar>
       </Toolbar>
       {(!store.ui.clip.disabled ||
@@ -220,6 +323,35 @@ const EditorView = observer(function Editor() {
             />
           )}
         </InfoTopRight>
+      )}
+      {showModelSelector && (
+        <ModelSelector
+          onClose={() => setShowModelSelector(false)}
+          onSelect={async (code, modelInfo) => {
+            console.log('Добавление модели:', modelInfo?.name || 'неизвестная');
+            
+            // Добавляем новую модель в список
+            const newModel = {
+              name: modelInfo?.name || 'model',
+              displayName: modelInfo?.displayName || modelInfo?.name || 'model',
+              code: code,
+              width: modelInfo?.defaultParams?.width || 1000,
+              height: modelInfo?.defaultParams?.height || 2000,
+              defaultParams: modelInfo?.defaultParams || {},
+            };
+            
+            const updatedModels = [...addedModels, newModel];
+            setAddedModels(updatedModels);
+            
+            // Генерируем код сборки из всех моделей
+            const assemblyCode = generateAssemblyCode(updatedModels);
+            
+            console.log('Сгенерирован код сборки:', assemblyCode.substring(0, 200) + '...');
+            
+            // Обновляем код в редакторе напрямую и сохраняем в localStorage
+            store.code.update(assemblyCode, true);
+          }}
+        />
       )}
       {store.ui.showDownload && (
         <DownloadDialog onClose={() => store.ui.changeDownload(false)} />
